@@ -28,6 +28,7 @@ import config  # ⚠️ phải import trước LangChain
 import numpy as np
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import FAISS
 from ragas import evaluate, EvaluationDataset, SingleTurnSample
 from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision
 
@@ -37,16 +38,21 @@ from qa_pairs import QA_PAIRS
 
 
 # ── 1. Prompt Templates (copy từ Bước 2) ──────────────────────────────────
-# TODO: Copy SYSTEM_V1 và SYSTEM_V2 mà bạn đã viết ở file 02_prompt_hub_ab_routing.py
-# ⚠️ Cả 2 phải chứa {context}, ví dụ kết thúc bằng "...\n\nContext:\n{context}"
-#    Thiếu {context} → LLM không thấy tài liệu, không báo lỗi, faithfulness/context_* rất thấp.
-SYSTEM_V1 = ...
+SYSTEM_V1 = (
+    "Bạn là trợ lý AI thân thiện. Trả lời ngắn gọn (2-4 câu), chỉ dựa trên context. "
+    "Nếu không có thông tin, hãy nói thẳng là không biết.\n\n"
+    "Context:\n{context}"
+)
 PROMPT_V1 = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_V1),
     ("human",  "{question}"),
 ])
 
-SYSTEM_V2 = ...
+SYSTEM_V2 = (
+    "Bạn là chuyên gia phân tích thông tin. Đọc kỹ context, xác định các facts liên quan, "
+    "rồi viết câu trả lời rõ ràng, có tổ chức (3-5 câu). Không suy đoán ngoài context.\n\n"
+    "Context:\n{context}"
+)
 PROMPT_V2 = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_V2),
     ("human",  "{question}"),
@@ -58,40 +64,42 @@ PROMPTS = {"v1": PROMPT_V1, "v2": PROMPT_V2}
 # ── 2. Setup Vectorstore ───────────────────────────────────────────────────
 def setup_vectorstore():
     """Tái sử dụng — tạo FAISS vectorstore từ knowledge base."""
+    cache_dir = Path(__file__).parent.parent / "data" / ".ragas_cache"
+    embedding_model = {
+        "openai": config.OPENAI_EMBEDDING_MODEL,
+        "gemini": config.GEMINI_EMBEDDING_MODEL,
+    }.get(config.PROVIDER, config.PROVIDER)
+    index_dir = cache_dir / f"faiss_index_{config.PROVIDER}_{embedding_model.replace('/', '_')}"
     embeddings  = get_embeddings()
+    if (index_dir / "index.faiss").exists() and (index_dir / "index.pkl").exists():
+        print("📦 Nạp FAISS index đã lưu trong checkpoint...")
+        return FAISS.load_local(
+            str(index_dir), embeddings, allow_dangerous_deserialization=True
+        )
     text        = load_knowledge_base()
-    chunks      = split_text(text)
-    return build_vectorstore(chunks, embeddings)
+    chunk_size  = 600 if config.PROVIDER == "gemini" else 500
+    chunks      = split_text(text, chunk_size=chunk_size, chunk_overlap=chunk_size // 10)
+    vectorstore = build_vectorstore(chunks, embeddings)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    vectorstore.save_local(str(index_dir))
+    print("💾 Đã lưu FAISS index vào checkpoint")
+    return vectorstore
 
 
 # ── 3. Chạy RAG và thu thập kết quả ───────────────────────────────────────
 def run_rag(retriever, llm, prompt, question: str) -> dict:
     """
     Chạy RAG chain cho 1 câu hỏi.
-
-    ⚠️ QUAN TRỌNG: trả về contexts là LIST of strings, KHÔNG phải string đã ghép!
-    RAGAS cần từng đoạn riêng để tính context_recall và context_precision.
-
     Trả về: {"answer": str, "contexts": list[str]}
     """
-    # TODO: Retrieve documents từ retriever
-    docs = ...
-
-    # TODO: Tạo contexts là danh sách page_content (KHÔNG ghép chuỗi ở đây)
-    # Gợi ý: contexts = [doc.page_content for doc in docs]
-    contexts = ...   # phải là list[str] !
-
-    # TODO: Ghép contexts thành 1 string để truyền vào {context} của prompt
+    docs = retriever.invoke(question)
+    contexts = [doc.page_content for doc in docs]
     ctx_str = "\n\n".join(contexts)
-
-    # TODO: Chạy chain (prompt | llm | StrOutputParser()).invoke(...)
     answer = (prompt | llm | StrOutputParser()).invoke({
-        "context":  ...,
-        "question": ...,
+        "context":  ctx_str,
+        "question": question,
     })
-
-    # TODO: Trả về dict với answer và contexts (list)
-    return {"answer": ..., "contexts": ...}
+    return {"answer": answer, "contexts": contexts}
 
 
 def collect_rag_outputs(vectorstore, prompt_version: str) -> list:
@@ -103,20 +111,37 @@ def collect_rag_outputs(vectorstore, prompt_version: str) -> list:
     llm       = get_llm()
     prompt    = PROMPTS[prompt_version]
 
+    cache_dir = Path(__file__).parent.parent / "data" / ".ragas_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    model_name = {
+        "openai": config.OPENAI_MODEL,
+        "gemini": config.GEMINI_MODEL,
+    }.get(config.PROVIDER, config.PROVIDER)
+    cache_path = cache_dir / f"{prompt_version}_{config.PROVIDER}_{model_name.replace('/', '_')}_outputs.json"
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(cached, list):
+            cached = []
+    except (OSError, json.JSONDecodeError):
+        cached = []
+
     results = []
     print(f"\n🚀 Đang chạy 50 câu hỏi với prompt {prompt_version} ...")
 
     for i, qa in enumerate(QA_PAIRS, 1):
-        # TODO: Gọi run_rag() cho câu hỏi hiện tại
-        out = ...
-
-        # TODO: Append vào results dict với 4 keys
-        results.append({
+        if i <= len(cached) and cached[i - 1].get("question") == qa["question"] and cached[i - 1].get("reference") == qa["reference"]:
+            results.append(cached[i - 1])
+            print(f"  [{i:02d}/50] Đã nạp câu trả lời đã lưu")
+            continue
+        out = run_rag(retriever, llm, prompt, qa["question"])
+        row = {
             "question":  qa["question"],
             "reference": qa["reference"],
-            "answer":    ...,        # out["answer"]
-            "contexts":  ...,        # out["contexts"] — phải là list[str] !
-        })
+            "answer":    out["answer"],
+            "contexts":  out["contexts"],
+        }
+        results.append(row)
+        cache_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"  [{i:02d}/50] {qa['question'][:60]}")
 
     return results
@@ -126,25 +151,16 @@ def collect_rag_outputs(vectorstore, prompt_version: str) -> list:
 def build_ragas_dataset(rag_results: list) -> EvaluationDataset:
     """
     Chuyển đổi kết quả RAG thành RAGAS EvaluationDataset.
-
-    Mỗi SingleTurnSample cần 4 trường:
-      user_input         → câu hỏi
-      response           → câu trả lời đã tạo
-      retrieved_contexts → list[str] các đoạn đã retrieve
-      reference          → đáp án chuẩn (ground truth)
     """
-    # TODO: Tạo list các SingleTurnSample từ rag_results
     samples = [
         SingleTurnSample(
-            user_input=...,           # r["question"]
-            response=...,             # r["answer"]
-            retrieved_contexts=...,   # r["contexts"]
-            reference=...,            # r["reference"]
+            user_input=r["question"],
+            response=r["answer"],
+            retrieved_contexts=r["contexts"],
+            reference=r["reference"],
         )
         for r in rag_results
     ]
-
-    # TODO: Wrap thành EvaluationDataset và trả về
     return EvaluationDataset(samples=samples)
 
 
@@ -153,35 +169,27 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
     """
     Đánh giá kết quả RAG với 4 RAGAS metrics.
     Trả về: dict {metric_name: mean_score}
-
-    Lưu ý: evaluate() thực hiện rất nhiều lần gọi LLM → mất 5-10 phút / version.
     """
     print(f"\n📐 Đang đánh giá RAGAS cho prompt {version} ... (vui lòng chờ ~5-10 phút)")
 
-    # TODO: Tạo EvaluationDataset từ rag_results
-    dataset = ...
+    from ragas.run_config import RunConfig
+    
+    # Giảm xuống 10 tác vụ để tránh hết quota 402 OpenRouter
+    dataset = build_ragas_dataset(rag_results[:10])
 
     # LLM và Embeddings riêng để RAGAS dùng làm evaluator
     llm_eval = get_llm(temperature=0)
     emb_eval = get_embeddings()
 
-    # TODO: Gọi evaluate() với đầy đủ 4 metrics
-    # Gợi ý:
-    #   result = evaluate(
-    #       dataset,
-    #       metrics=[faithfulness, answer_relevancy, context_recall, context_precision],
-    #       llm=llm_eval,
-    #       embeddings=emb_eval,
-    #   )
     result = evaluate(
-        ...,
-        metrics=[...],
-        llm=...,
-        embeddings=...,
+        dataset,
+        metrics=[faithfulness, answer_relevancy, context_recall, context_precision],
+        llm=llm_eval,
+        embeddings=emb_eval,
+        run_config=RunConfig(max_workers=1, max_retries=3)
     )
 
     # Tính mean score cho mỗi metric
-    # result["faithfulness"] trả về list of floats → dùng np.mean()
     scores = {}
     for key in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
         raw = result[key]
@@ -205,8 +213,7 @@ def main():
     if not config.validate():
         sys.exit(1)
 
-    # TODO: Tạo vectorstore
-    vectorstore = ...
+    vectorstore = setup_vectorstore()
 
     # Thu thập kết quả RAG cho cả V1 và V2
     v1_results = collect_rag_outputs(vectorstore, "v1")
@@ -233,17 +240,17 @@ def main():
         print(f"\n⚠️  Chưa đạt mục tiêu ({best_faith:.4f} < 0.8).")
         print("   Gợi ý: giảm chunk_size, tăng k, hoặc điều chỉnh prompt.")
 
-    # TODO: Lưu báo cáo vào data/ragas_report.json
     report = {
         "prompt_v1_scores": v1_scores,
         "prompt_v2_scores": v2_scores,
         "target_met": best_faith >= 0.8,
     }
     report_path = Path(__file__).parent.parent / "data" / "ragas_report.json"
-    # TODO: Ghi report vào file bằng json.dumps hoặc json.dump
-    # Gợi ý: report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    ...
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"💾 Đã lưu báo cáo vào {report_path}")
+    evidence_path = report_path.parent.parent / "evidence" / "03_ragas_report.json"
+    evidence_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"💾 Đã lưu bản evidence vào {evidence_path}")
 
 
 if __name__ == "__main__":
